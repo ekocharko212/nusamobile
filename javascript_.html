@@ -1,0 +1,642 @@
+<script>
+(function(){
+  'use strict';
+
+  // ---------------- State ----------------
+  let BOOT = null;          // hasil login()/resumeSession()
+  let SESSION_TOKEN = null; // token sesi HMAC dari server (Auth.gs)
+  let CURRENT_VIEW = 'grid';
+  let ADMIN_APPS = [];
+  let ADMIN_USERS = [];
+
+  // ---------------- Session token storage (localStorage, tahan reload) ----------------
+  const TOKEN_KEY = 'nusa_session_token';
+  function getStoredToken(){ return safeGet('localStorage', TOKEN_KEY); }
+  function storeToken(token){ SESSION_TOKEN = token; safeSet('localStorage', TOKEN_KEY, token); }
+  function clearStoredToken(){ SESSION_TOKEN = null; safeRemove('localStorage', TOKEN_KEY); }
+
+  // ---------------- Safe storage (Safari/iOS blok akses localStorage & sessionStorage
+  // di dalam iframe cross-origin milik Google Apps Script / ITP). Semua akses
+  // dibungkus try/catch dan fallback ke memori in-page supaya script tidak
+  // berhenti total (uncaught exception) saat storage diblokir. ----------------
+  const memStore = {};
+  function safeGet(type, key){
+    try { return window[type].getItem(key); } catch(e){ return memStore[type + ':' + key] !== undefined ? memStore[type + ':' + key] : null; }
+  }
+  function safeSet(type, key, value){
+    try { window[type].setItem(key, value); } catch(e){ memStore[type + ':' + key] = value; }
+  }
+  function safeRemove(type, key){
+    try { window[type].removeItem(key); } catch(e){ delete memStore[type + ':' + key]; }
+  }
+
+  // ---------------- Deteksi iOS / in-app browser ----------------
+  // Dipakai untuk memberi instruksi yang tepat saat login otomatis Google
+  // gagal, karena di iOS ini hampir selalu disebabkan oleh proteksi
+  // "Prevent Cross-Site Tracking" Safari (memblokir cookie login Google
+  // di dalam iframe script.googleusercontent.com), atau karena link dibuka
+  // dari in-app browser (WhatsApp/Instagram/dll) yang tidak berbagi sesi
+  // login dengan Safari.
+  function isIOSDevice(){
+    const ua = window.navigator.userAgent || '';
+    const iOSByUA = /iPad|iPhone|iPod/.test(ua);
+    // iPadOS 13+ menyamar sebagai Mac, dibedakan lewat dukungan touch.
+    const iPadOS13 = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+    return (iOSByUA || iPadOS13) && !window.MSStream;
+  }
+  function isInAppBrowser(){
+    const ua = window.navigator.userAgent || '';
+    return /FBAN|FBAV|Instagram|Line\/|MicroMessenger|TikTok|GSA\/|WhatsApp/i.test(ua);
+  }
+  function iosHelpMessage(){
+    if (isInAppBrowser()) {
+      return 'Link ini terbuka di dalam aplikasi lain (mis. WhatsApp/Instagram) sehingga login Google tidak bisa terbaca. Ketuk menu (⋯) di pojok kanan atas lalu pilih "Buka di Safari", kemudian coba lagi.';
+    }
+    return 'Di iPhone/iPad, coba langkah berikut: buka link ini langsung di Safari, pastikan Anda sudah login akun Google di Safari, lalu ketuk ikon "AA" di kiri address bar → Website Settings → matikan "Cross-Website Tracking" untuk situs ini, dan muat ulang halaman.';
+  }
+
+  // ---------------- Sign-In Google (redirect penuh, ditangani server di Code.gs/Auth.gs) ----------------
+  // Tombol "Sign in with Google" adalah <a href="..."> biasa (lihat Index.html)
+  // yang membawa browser pindah halaman penuh ke accounts.google.com, lalu
+  // Google redirect balik membawa ?code=... yang ditukar server-side. Tidak
+  // ada lagi library GIS / origin check di sisi client sama sekali.
+
+  function handleLoginResult(data){
+    if (data.status === 'NO_EMAIL' || data.status === 'DOMAIN_REJECTED') {
+      // Login Google gagal diverifikasi / domain ditolak - jangan simpan token.
+      handleBoot(data, false);
+      return;
+    }
+    if (data.sessionToken) storeToken(data.sessionToken);
+    handleBoot(data, false);
+  }
+
+  function showLoginView(){
+    showView('view-login');
+    if (window.OAUTH_ERROR) {
+      const hint = document.getElementById('oauthErrorHint');
+      if (hint) { hint.textContent = window.OAUTH_ERROR; hint.hidden = false; }
+    }
+  }
+
+  // ---------------- Theme ----------------
+  function initTheme(){
+    let saved = null;
+    saved = safeGet('localStorage', 'nusa_theme');
+    if (!saved) {
+      saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    setTheme(saved);
+  }
+  function setTheme(mode){
+    document.documentElement.setAttribute('data-theme', mode);
+    document.getElementById('themeIcon').textContent = mode === 'dark' ? 'light_mode' : 'dark_mode';
+    safeSet('localStorage', 'nusa_theme', mode);
+  }
+  document.getElementById('btnThemeToggle').addEventListener('click', function(){
+    const cur = document.documentElement.getAttribute('data-theme');
+    setTheme(cur === 'dark' ? 'light' : 'dark');
+  });
+
+  // ---------------- View switching ----------------
+  function showView(id){
+    document.querySelectorAll('.view').forEach(v => v.hidden = true);
+    document.getElementById(id).hidden = false;
+  }
+  function toast(msg, isError){
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast' + (isError ? ' error' : '');
+    t.hidden = false;
+    clearTimeout(window._toastTimer);
+    window._toastTimer = setTimeout(() => t.hidden = true, 3200);
+  }
+
+  // ---------------- Session cache (client-side, avoids re-fetch within window) ----------------
+  function getCachedBoot(){
+    try {
+      const raw = safeGet('sessionStorage', 'nusa_boot');
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      const ageHours = (Date.now() - data._cachedAt) / 3600000;
+      if (ageHours > (data.sessionHours || 8)) return null;
+      return data;
+    } catch(e){ return null; }
+  }
+  function setCachedBoot(data){
+    try {
+      data._cachedAt = Date.now();
+      safeSet('sessionStorage', 'nusa_boot', JSON.stringify(data));
+    } catch(e){ /* ignore */ }
+  }
+
+  // ---------------- Mobile splash gateway ----------------
+  function isMobileViewport(){
+    return window.matchMedia('(max-width: 820px)').matches;
+  }
+
+  function initEntry(){
+    // Kalau halaman ini baru saja dimuat sebagai hasil redirect balik dari
+    // accounts.google.com (Code.gs sudah menukar ?code=... jadi session
+    // token), langsung simpan token itu & lanjut boot() - lewati splash.
+    if (window.INITIAL_SESSION_TOKEN) {
+      storeToken(window.INITIAL_SESSION_TOKEN);
+      try { window.history.replaceState({}, document.title, window.location.pathname); } catch(e){}
+      boot();
+      return;
+    }
+
+    // Splash "NUSA mobile" hanya tampil di layar mobile, sebagai gerbang
+    // sebelum proses verifikasi Google Sign-In otomatis dijalankan.
+    // Di desktop, alur tetap seperti sebelumnya (langsung verifikasi).
+    if (isMobileViewport()) {
+      showView('view-splash');
+    } else {
+      boot();
+    }
+  }
+
+  document.getElementById('btnSplashMNusa').addEventListener('click', function(){
+    // Memulai alur boot(): cek token tersimpan (resumeSession) atau tampilkan
+    // tombol Sign-In Google (login) kalau belum pernah login.
+    boot();
+  });
+  document.getElementById('btnSplashKlikNusa').addEventListener('click', function(){
+    toast('🚧 klik NUSA sedang dalam pengembangan (Under Construction).');
+  });
+  // btnSplashInfoNusa adalah tautan langsung ke https://petanusantara.id/
+
+  // ---------------- Bootstrap flow ----------------
+  function boot(){
+    showView('view-loading');
+    const cached = getCachedBoot();
+    if (cached && (cached.status === 'MULTI_APP' || cached.status === 'SINGLE_APP') && getStoredToken()) {
+      handleBoot(cached, true);
+      return;
+    }
+    const token = getStoredToken();
+    if (!token) {
+      showLoginView();
+      return;
+    }
+    google.script.run
+      .withSuccessHandler(function(data){ handleLoginResult(data); })
+      .withFailureHandler(function(err){
+        // Token tersimpan sudah tidak valid/kedaluwarsa - minta login ulang.
+        clearStoredToken();
+        showLoginView();
+      })
+      .resumeSession(token);
+  }
+
+  function handleBoot(data, fromCache){
+    BOOT = data;
+    if (!fromCache) setCachedBoot(data);
+
+    if (data.status === 'NO_EMAIL' || data.status === 'DOMAIN_REJECTED' || data.status === 'NO_ACCESS') {
+      document.getElementById('topbar').hidden = true;
+      let msg = data.message;
+      const contactBtn = document.getElementById('btnContactAdmin');
+      contactBtn.hidden = true;
+
+      // Akun sudah berhasil login Google (email terbaca), tapi belum
+      // terdaftar / belum diberi otorisasi oleh admin. Tampilkan himbauan
+      // pengajuan akses + tombol WhatsApp langsung ke petugas pengelola.
+      if (data.status === 'NO_ACCESS') {
+        msg = 'Tolong akun Gmail Anda ajukan terlebih dahulu kepada petugas pengelola aplikasi ini untuk mendapatkan otorisasi dan akses. Hubungi 087822000075 (Pak Charko).';
+        const waText = encodeURIComponent(
+          'Halo Pak Charko, saya ingin mengajukan akses ke aplikasi NUSA mobile.\n' +
+          'Email Gmail saya: ' + (data.email || '-')
+        );
+        contactBtn.href = 'https://wa.me/6287822000075?text=' + waText;
+        contactBtn.hidden = false;
+      } else if (data.status === 'NO_EMAIL' && isIOSDevice()) {
+        msg = (msg ? msg + ' ' : '') + iosHelpMessage();
+      }
+
+      document.getElementById('noaccessMessage').textContent = msg;
+      document.getElementById('noaccessEmail').textContent = data.email || '';
+      showView('view-noaccess');
+      return;
+    }
+
+    // Sukses - tampilkan topbar & user chip
+    setupTopbar(data);
+
+    if (data.status === 'SINGLE_APP') {
+      const app = data.apps[0];
+      document.getElementById('redirectAppName').textContent = app.Nama;
+      const btn = document.getElementById('btnManualOpen');
+      btn.href = app.URL;
+      showView('view-redirect');
+      google.script.run.recordAppOpen(SESSION_TOKEN, app.AppID);
+      setTimeout(function(){ window.location.href = app.URL; }, 900);
+      return;
+    }
+
+    // MULTI_APP -> dashboard launcher
+    renderDashboard(data);
+    showView('view-dashboard');
+  }
+
+  function setupTopbar(data){
+    document.getElementById('topbar').hidden = false;
+    document.getElementById('userChip').hidden = false;
+    document.getElementById('userName').textContent = data.nama;
+    document.getElementById('userRole').textContent = data.role;
+    document.getElementById('userAvatar').textContent = (data.nama || data.email || '?').trim().charAt(0);
+    document.getElementById('btnGoAdmin').hidden = !data.isAdmin;
+  }
+
+  // ---------------- User menu ----------------
+  const userChip = document.getElementById('userChip');
+  const userMenu = document.getElementById('userMenu');
+  userChip.addEventListener('click', function(e){
+    e.stopPropagation();
+    userMenu.hidden = !userMenu.hidden;
+  });
+  document.addEventListener('click', function(){ userMenu.hidden = true; });
+  document.getElementById('btnGoDashboard').addEventListener('click', function(){
+    userMenu.hidden = true;
+    showView('view-dashboard');
+  });
+  document.getElementById('btnGoAdmin').addEventListener('click', function(){
+    userMenu.hidden = true;
+    openAdmin();
+  });
+  document.getElementById('btnLogout').addEventListener('click', function(){
+    safeRemove('sessionStorage', 'nusa_boot');
+    clearStoredToken();
+    toast('Sesi lokal dihapus. Untuk keluar sepenuhnya dari akun Google, keluar melalui akun Google Anda.');
+    setTimeout(function(){ window.location.reload(); }, 1200);
+  });
+  document.getElementById('btnRetry').addEventListener('click', function(){
+    safeRemove('sessionStorage', 'nusa_boot');
+    window.location.reload();
+  });
+
+  // ---------------- Dashboard / launcher ----------------
+  function renderDashboard(data){
+    document.getElementById('dashUserFirstName').textContent = (data.nama || '').split(' ')[0] || data.email;
+
+    const cats = Array.from(new Set(data.apps.map(a => a.Kategori).filter(Boolean)));
+    const pillsWrap = document.getElementById('categoryPills');
+    pillsWrap.innerHTML = '';
+    const allPill = makePill('Semua', true);
+    pillsWrap.appendChild(allPill);
+    cats.forEach(c => pillsWrap.appendChild(makePill(c, false)));
+
+    pillsWrap.addEventListener('click', function(e){
+      const pill = e.target.closest('.pill');
+      if (!pill) return;
+      pillsWrap.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+      filterApps();
+    });
+
+    document.getElementById('appSearch').addEventListener('input', filterApps);
+
+    document.getElementById('btnViewGrid').addEventListener('click', function(){ setLauncherView('grid'); });
+    document.getElementById('btnViewList').addEventListener('click', function(){ setLauncherView('list'); });
+
+    buildAppGrid(data.apps);
+  }
+
+  function makePill(label, active){
+    const b = document.createElement('button');
+    b.className = 'pill' + (active ? ' active' : '');
+    b.textContent = label;
+    b.dataset.cat = label;
+    return b;
+  }
+
+  function setLauncherView(mode){
+    CURRENT_VIEW = mode;
+    document.getElementById('btnViewGrid').classList.toggle('active', mode === 'grid');
+    document.getElementById('btnViewList').classList.toggle('active', mode === 'list');
+    document.getElementById('appGrid').classList.toggle('list-mode', mode === 'list');
+  }
+
+  function buildAppGrid(apps){
+    const grid = document.getElementById('appGrid');
+    grid.innerHTML = '';
+    apps.forEach(app => grid.appendChild(appCard(app)));
+    grid.dataset.allApps = JSON.stringify(apps);
+  }
+
+  function appCard(app){
+    const a = document.createElement('a');
+    a.href = app.URL;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.className = 'app-card';
+    a.dataset.nama = (app.Nama || '').toLowerCase();
+    a.dataset.kategori = app.Kategori || '';
+    const color = app.Warna || '#2D6A4F';
+    a.innerHTML =
+      '<div class="app-glow" style="background:' + color + '"></div>' +
+      '<div class="app-card-top">' +
+        '<div class="app-icon" style="background:' + color + '"><span class="material-icons-round">' + (app.Icon || 'apps') + '</span></div>' +
+      '</div>' +
+      '<h3>' + escapeHtml(app.Nama) + '</h3>' +
+      '<p class="app-desc">' + escapeHtml(app.Deskripsi || '') + '</p>' +
+      (app.Kategori ? '<span class="app-cat">' + escapeHtml(app.Kategori) + '</span>' : '') +
+      '<span class="app-card-btn"><span class="material-icons-round" style="font-size:16px;">open_in_new</span> Buka</span>';
+    a.addEventListener('click', function(){ google.script.run.recordAppOpen(SESSION_TOKEN, app.AppID); });
+    return a;
+  }
+
+  function filterApps(){
+    const query = document.getElementById('appSearch').value.toLowerCase().trim();
+    const activePill = document.querySelector('.pill.active');
+    const cat = activePill ? activePill.dataset.cat : 'Semua';
+    const grid = document.getElementById('appGrid');
+    const allApps = JSON.parse(grid.dataset.allApps || '[]');
+
+    const filtered = allApps.filter(app => {
+      const matchQuery = !query || (app.Nama || '').toLowerCase().includes(query);
+      const matchCat = cat === 'Semua' || app.Kategori === cat;
+      return matchQuery && matchCat;
+    });
+
+    grid.innerHTML = '';
+    filtered.forEach(app => grid.appendChild(appCard(app)));
+    document.getElementById('appEmptyState').hidden = filtered.length !== 0;
+  }
+
+  function escapeHtml(str){
+    return String(str || '').replace(/[&<>"']/g, function(c){
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
+
+  // ================================================================
+  // ADMIN PANEL
+  // ================================================================
+  function openAdmin(){
+    showView('view-admin');
+    loadAdminOverview();
+  }
+
+  document.querySelectorAll('.admin-nav-item').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.admin-nav-item').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.admin-tab').forEach(t => t.classList.remove('active'));
+      btn.classList.add('active');
+      const tab = btn.dataset.tab;
+      document.getElementById('tab-' + tab).classList.add('active');
+      if (tab === 'overview') loadAdminOverview();
+      if (tab === 'users') loadAdminUsers();
+      if (tab === 'apps') loadAdminApps();
+      if (tab === 'access') loadAdminAccess();
+      if (tab === 'logs') loadAdminLogs();
+    });
+  });
+
+  // ---------- Overview ----------
+  function loadAdminOverview(){
+    google.script.run.withSuccessHandler(renderOverview).withFailureHandler(adminError).adminGetDashboardStats(SESSION_TOKEN);
+  }
+  function renderOverview(stats){
+    const grid = document.getElementById('statGrid');
+    grid.innerHTML = [
+      statCard('Total User', stats.jumlahUser),
+      statCard('Total Aplikasi', stats.jumlahAplikasi),
+      statCard('Login Hari Ini', stats.loginHariIni),
+      statCard('User Online (hari ini)', stats.userOnline)
+    ].join('');
+
+    drawBarChart('chartDaily', stats.dailyChart.map(d => d.tanggal.slice(5)), stats.dailyChart.map(d => d.jumlah));
+
+    const list = document.getElementById('topAppsList');
+    list.innerHTML = stats.topApps.length ? stats.topApps.map(function(a){
+      return '<div class="top-app-row"><span>' + escapeHtml(a.nama) + '</span><span class="top-app-badge">' + a.jumlah + 'x</span></div>';
+    }).join('') : '<p class="tab-hint">Belum ada data.</p>';
+  }
+  function statCard(label, value){
+    return '<div class="stat-card"><div class="stat-label">' + label + '</div><div class="stat-value">' + value + '</div></div>';
+  }
+  function drawBarChart(canvasId, labels, values){
+    const canvas = document.getElementById(canvasId);
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 400, h = canvas.clientHeight || 180;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    const max = Math.max.apply(null, values.concat([1]));
+    const barW = w / (values.length || 1) * 0.6;
+    const gap = w / (values.length || 1);
+    const styles = getComputedStyle(document.documentElement);
+    ctx.fillStyle = styles.getPropertyValue('--gold-500').trim() || '#C9A227';
+    values.forEach(function(v, i){
+      const barH = (v / max) * (h - 26);
+      const x = i * gap + (gap - barW) / 2;
+      const y = h - barH - 20;
+      ctx.beginPath();
+      ctx.roundRect ? ctx.roundRect(x, y, barW, barH, 4) : ctx.rect(x, y, barW, barH);
+      ctx.fill();
+      ctx.fillStyle = styles.getPropertyValue('--text-secondary').trim() || '#666';
+      ctx.font = '10px Inter';
+      ctx.textAlign = 'center';
+      ctx.fillText(labels[i], x + barW / 2, h - 6);
+      ctx.fillStyle = styles.getPropertyValue('--gold-500').trim() || '#C9A227';
+    });
+  }
+
+  // ---------- Users ----------
+  function loadAdminUsers(){
+    google.script.run.withSuccessHandler(function(users){
+      ADMIN_USERS = users;
+      renderUsersTable(users);
+    }).withFailureHandler(adminError).adminGetUsers(SESSION_TOKEN);
+  }
+  function renderUsersTable(users){
+    const tbody = document.querySelector('#usersTable tbody');
+    tbody.innerHTML = users.map(function(u){
+      return '<tr>' +
+        '<td>' + escapeHtml(u.Email) + '</td>' +
+        '<td>' + escapeHtml(u.Nama) + '</td>' +
+        '<td>' + escapeHtml(u.Jabatan) + '</td>' +
+        '<td>' + escapeHtml(u.Role) + '</td>' +
+        '<td><span class="badge ' + (String(u.Status).toLowerCase() === 'aktif' ? 'aktif' : 'nonaktif') + '">' + escapeHtml(u.Status) + '</span></td>' +
+        '<td>' +
+          '<button class="table-btn" data-action="edit-user" data-email="' + escapeHtml(u.Email) + '">Edit</button>' +
+          '<button class="table-btn" data-action="toggle-user" data-email="' + escapeHtml(u.Email) + '" data-status="' + escapeHtml(u.Status) + '">' +
+            (String(u.Status).toLowerCase() === 'aktif' ? 'Nonaktifkan' : 'Aktifkan') +
+          '</button>' +
+        '</td></tr>';
+    }).join('') || '<tr><td colspan="6" class="tab-hint">Belum ada user.</td></tr>';
+  }
+  document.getElementById('userSearch').addEventListener('input', function(e){
+    const q = e.target.value.toLowerCase();
+    renderUsersTable(ADMIN_USERS.filter(u => (u.Email + u.Nama).toLowerCase().includes(q)));
+  });
+  document.querySelector('#usersTable tbody').addEventListener('click', function(e){
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    if (btn.dataset.action === 'edit-user') openUserModal(btn.dataset.email);
+    if (btn.dataset.action === 'toggle-user') {
+      const newStatus = btn.dataset.status.toLowerCase() === 'aktif' ? 'Nonaktif' : 'Aktif';
+      google.script.run.withSuccessHandler(function(){ toast('Status user diperbarui.'); loadAdminUsers(); })
+        .withFailureHandler(adminError).adminSetUserStatus(SESSION_TOKEN, btn.dataset.email, newStatus);
+    }
+  });
+  document.getElementById('btnNewUser').addEventListener('click', function(){ openUserModal(null); });
+  function openUserModal(email){
+    const u = email ? ADMIN_USERS.find(x => x.Email === email) : null;
+    document.getElementById('userModalTitle').textContent = u ? 'Edit User' : 'Tambah User';
+    document.getElementById('fUserEmail').value = u ? u.Email : '';
+    document.getElementById('fUserEmail').disabled = !!u;
+    document.getElementById('fUserNama').value = u ? u.Nama : '';
+    document.getElementById('fUserJabatan').value = u ? u.Jabatan : '';
+    document.getElementById('fUserRole').value = u ? u.Role : 'Viewer';
+    document.getElementById('fUserStatus').value = u ? u.Status : 'Aktif';
+    document.getElementById('userModal').hidden = false;
+  }
+  document.getElementById('btnUserCancel').addEventListener('click', function(){ document.getElementById('userModal').hidden = true; });
+  document.getElementById('btnUserSave').addEventListener('click', function(){
+    const payload = {
+      Email: document.getElementById('fUserEmail').value.trim(),
+      Nama: document.getElementById('fUserNama').value.trim(),
+      Jabatan: document.getElementById('fUserJabatan').value.trim(),
+      Role: document.getElementById('fUserRole').value,
+      Status: document.getElementById('fUserStatus').value
+    };
+    if (!payload.Email) { toast('Email wajib diisi.', true); return; }
+    google.script.run.withSuccessHandler(function(){
+      document.getElementById('userModal').hidden = true;
+      toast('User tersimpan.');
+      loadAdminUsers();
+    }).withFailureHandler(adminError).adminSaveUser(SESSION_TOKEN, payload);
+  });
+
+  // ---------- Applications ----------
+  function loadAdminApps(){
+    google.script.run.withSuccessHandler(function(apps){
+      ADMIN_APPS = apps;
+      renderAppsTable(apps);
+    }).withFailureHandler(adminError).adminGetApplications(SESSION_TOKEN);
+  }
+  function renderAppsTable(apps){
+    const tbody = document.querySelector('#appsTable tbody');
+    tbody.innerHTML = apps.map(function(a){
+      return '<tr>' +
+        '<td><span class="material-icons-round" style="color:' + a.Warna + '">' + (a.Icon || 'apps') + '</span></td>' +
+        '<td>' + escapeHtml(a['Nama Aplikasi']) + '</td>' +
+        '<td>' + escapeHtml(a.Kategori) + '</td>' +
+        '<td style="max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + escapeHtml(a.URL) + '</td>' +
+        '<td><span class="badge ' + (String(a.Status).toLowerCase() === 'aktif' ? 'aktif' : 'nonaktif') + '">' + escapeHtml(a.Status) + '</span></td>' +
+        '<td><button class="table-btn" data-action="edit-app" data-id="' + escapeHtml(a.AppID) + '">Edit</button></td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="6" class="tab-hint">Belum ada aplikasi.</td></tr>';
+  }
+  document.getElementById('appMgmtSearch').addEventListener('input', function(e){
+    const q = e.target.value.toLowerCase();
+    renderAppsTable(ADMIN_APPS.filter(a => (a['Nama Aplikasi'] || '').toLowerCase().includes(q)));
+  });
+  document.querySelector('#appsTable tbody').addEventListener('click', function(e){
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    if (btn.dataset.action === 'edit-app') openAppModal(btn.dataset.id);
+  });
+  document.getElementById('btnNewApp').addEventListener('click', function(){ openAppModal(null); });
+  function openAppModal(appId){
+    const a = appId ? ADMIN_APPS.find(x => x.AppID === appId) : null;
+    document.getElementById('appModalTitle').textContent = a ? 'Edit Aplikasi' : 'Tambah Aplikasi';
+    document.getElementById('fAppId').value = a ? a.AppID : '';
+    document.getElementById('fAppNama').value = a ? a['Nama Aplikasi'] : '';
+    document.getElementById('fAppUrl').value = a ? a.URL : '';
+    document.getElementById('fAppIcon').value = a ? a.Icon : 'apps';
+    document.getElementById('fAppWarna').value = a ? a.Warna : '#2D6A4F';
+    document.getElementById('fAppKategori').value = a ? a.Kategori : '';
+    document.getElementById('fAppDeskripsi').value = a ? a.Deskripsi : '';
+    document.getElementById('fAppStatus').value = a ? a.Status : 'Aktif';
+    document.getElementById('appModal').hidden = false;
+  }
+  document.getElementById('btnAppCancel').addEventListener('click', function(){ document.getElementById('appModal').hidden = true; });
+  document.getElementById('btnAppSave').addEventListener('click', function(){
+    const payload = {
+      AppID: document.getElementById('fAppId').value || null,
+      Nama: document.getElementById('fAppNama').value.trim(),
+      URL: document.getElementById('fAppUrl').value.trim(),
+      Icon: document.getElementById('fAppIcon').value.trim() || 'apps',
+      Warna: document.getElementById('fAppWarna').value,
+      Kategori: document.getElementById('fAppKategori').value.trim(),
+      Deskripsi: document.getElementById('fAppDeskripsi').value.trim(),
+      Status: document.getElementById('fAppStatus').value
+    };
+    if (!payload.Nama || !payload.URL) { toast('Nama dan URL wajib diisi.', true); return; }
+    google.script.run.withSuccessHandler(function(){
+      document.getElementById('appModal').hidden = true;
+      toast('Aplikasi tersimpan.');
+      loadAdminApps();
+    }).withFailureHandler(adminError).adminSaveApplication(SESSION_TOKEN, payload);
+  });
+
+  // ---------- Access matrix ----------
+  function loadAdminAccess(){
+    google.script.run.withSuccessHandler(renderAccessMatrix).withFailureHandler(adminError).adminGetAccessMatrix(SESSION_TOKEN);
+  }
+  function renderAccessMatrix(data){
+    const head = document.getElementById('accessTableHead');
+    head.innerHTML = '<th>User</th>' + data.apps.map(a => '<th>' + escapeHtml(a['Nama Aplikasi']) + '</th>').join('') + '<th></th>';
+
+    const tbody = document.querySelector('#accessTable tbody');
+    tbody.innerHTML = data.users.map(function(u){
+      const checks = data.apps.map(function(a){
+        const checked = u.appIds.indexOf(String(a.AppID)) !== -1 ? 'checked' : '';
+        return '<td style="text-align:center;"><input type="checkbox" data-app="' + escapeHtml(a.AppID) + '" ' + checked + '></td>';
+      }).join('');
+      return '<tr data-email="' + escapeHtml(u.email) + '">' +
+        '<td>' + escapeHtml(u.nama) + '<br><small class="tab-hint" style="margin:0;">' + escapeHtml(u.email) + '</small></td>' +
+        checks +
+        '<td><button class="table-btn" data-action="save-access">Simpan</button></td>' +
+        '</tr>';
+    }).join('') || '<tr><td class="tab-hint">Belum ada user.</td></tr>';
+  }
+  document.querySelector('#accessTable tbody').addEventListener('click', function(e){
+    const btn = e.target.closest('button[data-action="save-access"]');
+    if (!btn) return;
+    const row = btn.closest('tr');
+    const email = row.dataset.email;
+    const appIds = Array.from(row.querySelectorAll('input[type="checkbox"]:checked')).map(c => c.dataset.app);
+    google.script.run.withSuccessHandler(function(){ toast('Akses untuk ' + email + ' tersimpan.'); })
+      .withFailureHandler(adminError).adminSaveAccess(SESSION_TOKEN, email, appIds);
+  });
+
+  // ---------- Logs ----------
+  function loadAdminLogs(){
+    google.script.run.withSuccessHandler(renderLogsTable).withFailureHandler(adminError).adminGetLogs(SESSION_TOKEN, {});
+  }
+  function renderLogsTable(logs){
+    window._allLogs = logs;
+    paintLogs(logs);
+  }
+  function paintLogs(logs){
+    const tbody = document.querySelector('#logsTable tbody');
+    tbody.innerHTML = logs.map(function(l){
+      const statusOk = l.Status === 'Berhasil' || l.Status === 'Dibuka';
+      return '<tr>' +
+        '<td>' + escapeHtml(l.Tanggal) + '</td>' +
+        '<td>' + escapeHtml(l.Jam) + '</td>' +
+        '<td>' + escapeHtml(l.Email) + '</td>' +
+        '<td>' + escapeHtml(l.Aplikasi) + '</td>' +
+        '<td><span class="badge ' + (statusOk ? 'aktif' : 'nonaktif') + '">' + escapeHtml(l.Status) + '</span></td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="5" class="tab-hint">Belum ada log.</td></tr>';
+  }
+  document.getElementById('logSearch').addEventListener('input', function(e){
+    const q = e.target.value.toLowerCase();
+    paintLogs((window._allLogs || []).filter(l => String(l.Email).toLowerCase().includes(q)));
+  });
+
+  function adminError(err){
+    toast(err && err.message ? err.message : 'Terjadi kesalahan.', true);
+  }
+
+  // ---------------- Init ----------------
+  try { initTheme(); } catch(e){ console.error('initTheme gagal:', e); }
+  try { initEntry(); } catch(e){ console.error('initEntry gagal:', e); }
+})();
+</script>
